@@ -1,15 +1,17 @@
 #include <Wire.h>
 #include "SSD1306Wire.h"
 #include <WiFi.h>
+#include "Ticker.h"
 
 const char* ssid = "--ssid--"; // 要変更
 const char* password = "--password--"; // 要変更
-const char* scratchAddr = "192.168.10.7"; // 要変更（Scratchを実行しているPCのIPアドレス）
+const char* scratchAddr = "--ip address--"; // 要変更（Scratchを実行しているPCのIPアドレス）
 const int scratchPort = 42001;
 
 void mySetup(); // このスケッチ固有のsetup()
 void myLoop(); // このスケッチ固有のloop()
-void process(String str); // 受信したメッセージを処理
+void processSensorUpdate(String sensor, String value); // 受信したsensor-updateを処理
+void processBroadcast(String message); // 受信したbroadcastを処理
 
 SSD1306Wire display(0x3c, 21, 22);
 String displayBuffer[4];
@@ -23,20 +25,45 @@ void updateDisplay() {
   display.display();
 }
 
+Ticker messageTimer;
+volatile bool updateRequest = false;
+void showMessage(String s, float seconds) {
+  displayBuffer[3] = s;
+  updateDisplay();
+  messageTimer.once(seconds, hideMessage);
+}
+void hideMessage() {
+  displayBuffer[3] = "";
+  updateRequest = true;
+}
+
 WiFiClient client;
 int messageLength = 0;
 
 void sendScratch(String str) {
   if (client.connected()) {
     uint8_t sizebuf[4] = {0};
-    sizebuf[3] = (uint8_t)str.length();
+    unsigned int n = str.length();
+    sizebuf[0] = (uint8_t)(n >> 24) & 0xff;
+    sizebuf[1] = (uint8_t)(n >> 16) & 0xff;
+    sizebuf[2] = (uint8_t)(n >> 8) & 0xff;
+    sizebuf[3] = (uint8_t)n & 0xff;
     client.write(sizebuf, sizeof(sizebuf));
     client.write(str.c_str(), str.length());
   }
 }
 
+void sensorUpdate(String sensor, String value) {
+  sendScratch("sensor-update \"" + sensor + "\" " + value + " ");
+}
+
+void broadcast(String str) {
+  sendScratch("broadcast \"" + str + "\"");
+}
+
 void setup() {
   Serial.begin(57600);
+
   display.init();
 
   // このスケッチ固有のsetup()を実行
@@ -60,7 +87,14 @@ void setup() {
   updateDisplay();
 }
 
+void process(String str); // 受信したメッセージを処理
+
 void loop() {
+  if (updateRequest) {
+    updateRequest = false;
+    updateDisplay();
+  }
+
   // このスケッチ固有のloop()を実行
   myLoop();
 
@@ -78,7 +112,7 @@ void loop() {
       if (client.available() >= 4) {
         uint8_t buf[4];
         client.readBytes(buf, 4);
-        messageLength = (buf[2] << 8) + buf[3];
+        messageLength = (buf[0] << 24) + (buf[1] << 16) + (buf[2] << 8) + buf[3];
       }
     } else { // メッセージ本体を読み込む
       if (client.available() >= messageLength) {
@@ -92,21 +126,29 @@ void loop() {
   }
 }
 
+void process(String str) {
+  if (str.startsWith("sensor-update ")) {
+    str = str.substring(str.indexOf(' ') + 1); // センサー名の先頭の"以降
+    while (str.startsWith("\"")) {
+      String sensor = str.substring(1, str.indexOf(' ') - 1); // ダブルクォートの内側
+      str = str.substring(str.indexOf(' ') + 1); // 値の先頭以降
+      if (str.indexOf(' ') >= 0) {
+        String value = str.substring(0, str.indexOf(' ')); // スペースの直前まで
+        processSensorUpdate(sensor, value);
+        str = str.substring(str.indexOf(' ') + 1); // センサー名の先頭の"以降
+      } else {
+        processSensorUpdate(sensor, str);
+        break;
+      }
+    }
+  } else if (str.startsWith("broadcast ")) {
+    str = str.substring(str.indexOf(' ') + 1); // 文字列の先頭の"以降
+    String message = str.substring(1, str.length() - 1); // ダブルクォートの内側
+    processBroadcast(message);
+  }
+}
+
 // 以下、このスケッチ固有の記述
-
-#include "Ticker.h"
-
-Ticker timer1;
-volatile bool updateRequest = false;
-void showMessage(String s, float seconds) {
-  displayBuffer[3] = s;
-  updateDisplay();
-  timer1.once(seconds, hideMessage);  
-}
-void hideMessage() {
-  displayBuffer[3] = "";
-  updateRequest = true;
-}
 
 struct Interrupt {
   volatile unsigned int count = 0;
@@ -132,6 +174,8 @@ void rotateServo(int chan, float angle) { // 0(0.5ms) ~ 180(2.5ms)
 }
 
 void mySetup() {
+  pinMode(2, OUTPUT);
+
   for (int i = 0; i < sizeof(switchPins); i++) {
     int pin = switchPins[i];
     interruptList[pin].count = 0;
@@ -151,51 +195,31 @@ void mySetup() {
 }
 
 void myLoop() {
-  if (updateRequest) {
-    updateRequest = false;
-    updateDisplay();
-  }
-
   for (int i = 0; i < 40; i++) {
     if (interruptList[i].count > 0) {
       interruptList[i].count = 0;
-      String s = "broadcast \"catch " + String(i) + "\"";
-      sendScratch(s);
-
+      broadcast("catch " + String(i));
       showMessage("catch " + String(i), 0.5);
     }
   }
 }
 
-void process(String str) {
-  //Serial.println(str);
+void processSensorUpdate(String sensor, String str) {
+  showMessage(sensor + " " + str, 0.5);
 
-  if (str.startsWith("sensor-update ")) {
-    str = str.substring(str.indexOf(' ') + 1); // 変数名の先頭の"以降
-    while (str.startsWith("\"")) {
-      //Serial.println(str);
-      bool match = false;
-      // Servo + ピン番号
-      for (int i = 0; i < sizeof(servoPins); i++) {
-        int pin = servoPins[i];
-        String pat = "\"Servo" + String(pin) + "\" ";
-        if (str.startsWith(pat)) {
-          match = true;
-          showMessage(str, 0.5);
-          str = str.substring(str.indexOf(' ') + 1); // 値の先頭以降
-          float angle = str.toFloat();
-          rotateServo(i, angle);
-        }
-      }
-      if (!match) {
-          str = str.substring(str.indexOf(' ') + 1); // 値の先頭以降
-      }
-      if (str.indexOf(' ') >= 0) {
-        str = str.substring(str.indexOf(' ') + 1); // 変数名の先頭の"以降
-      }
-    }
-  } else if (str.startsWith("broadcast ")) {
-    str = str.substring(str.indexOf(' ') + 1); // 文字列の先頭の"以降
-    showMessage(str, 0.5);
+  if (sensor == "D2") {
+    digitalWrite(2, str.toInt());
   }
+
+  // Servo + ピン番号
+  for (int i = 0; i < sizeof(servoPins); i++) {
+    int pin = servoPins[i];
+    if (sensor == "Servo" + String(pin)) {
+      rotateServo(i, str.toFloat());
+    }
+  }
+}
+
+void processBroadcast(String str) {
+  showMessage(str, 0.5);
 }
